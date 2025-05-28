@@ -59,25 +59,29 @@ def format_state_for_response(state: Dict[str, Any]) -> ChatResponse:
         if isinstance(msg, tuple):
             role, content = msg
             messages.append(Message(role=role, content=content))
-        else:
+        elif hasattr(msg, 'content'):
             messages.append(Message(role="assistant", content=msg.content))
+        elif isinstance(msg, dict):
+            messages.append(Message(role=msg.get("role", "assistant"), content=msg.get("content", "")))
 
     needs_clarification = False
     clarification_questions = None
     concerns = None
 
-    if state.get("current_plan") and state["current_plan"].get("status") == "needs_clarification":
-        needs_clarification = True
-        analysis = state["current_plan"]["analysis"]
-        clarification_questions = analysis.get("clarification_questions", [])
-        concerns = analysis.get("concerns", [])
+    current_plan = state.get("current_plan")
+    if current_plan and isinstance(current_plan, dict):
+        if current_plan.get("status") == "needs_clarification":
+            needs_clarification = True
+            analysis = current_plan.get("analysis", {})
+            clarification_questions = analysis.get("clarification_questions", [])
+            concerns = analysis.get("concerns", [])
 
     return ChatResponse(
         messages=messages,
         needs_clarification=needs_clarification,
         clarification_questions=clarification_questions,
         concerns=concerns,
-        current_plan=state.get("current_plan"),
+        current_plan=current_plan,
         finished=state.get("finished", False)
     )
 

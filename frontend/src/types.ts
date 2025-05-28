@@ -40,4 +40,5 @@ export interface ChatResponse {
   concerns?: string[];
   current_plan?: Plan;
   finished: boolean;
+  error?: string;
 }
