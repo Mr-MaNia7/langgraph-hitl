@@ -1,8 +1,10 @@
 langgraph>=0.3.20
-langchain-google-genai>=0.0.5
+langchain-openai>=0.0.5
 fastapi>=0.115.12
 uvicorn>=0.34.0
 python-dotenv>=1.0.1
 typing-extensions>=4.12.2
 pydantic>=2.10.6
 langchain-core>=0.3.48
+gunicorn>=21.2.0
+rich>=13.9.5

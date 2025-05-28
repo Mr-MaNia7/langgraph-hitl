@@ -1,313 +1,530 @@
 from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
-from typing import Annotated
-from typing_extensions import TypedDict
+from langchain_openai import ChatOpenAI
+from typing import Annotated, TypedDict, Literal, List, Dict
 from langgraph.graph.message import add_messages
 from langchain_core.messages.ai import AIMessage
-from typing import Literal
 from langchain_core.tools import tool
-from pydantic import BaseModel
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command, interrupt
 from langgraph.prebuilt import ToolNode
-from langgraph.prebuilt import InjectedState
 from langchain_core.messages.tool import ToolMessage
-from collections.abc import Iterable
-from random import randint
-
 import os
 from dotenv import load_dotenv
+import logging
+from datetime import datetime
+import json
 
-load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", api_key = GOOGLE_API_KEY)
-
-class OrderState(TypedDict):
-    """State representing the customer's order conversation."""
-
-    messages: Annotated[list, add_messages]
-
-    order: list[str]
-
-    finished: bool
-
-BARISTABOT_SYSINT = (
-    "system", 
-    "You are a BaristaBot, an interactive cafe ordering system. A human will talk to you about the "
-    "available products you have and you will answer any questions about menu items (and only about "
-    "menu items - no off-topic discussion, but you can chat about the products and their history). "
-    "The customer will place an order for 1 or more items from the menu, which you will structure "
-    "and send to the ordering system after confirming the order with the human. "
-    "\n\n"
-    "Add items to the customer's order with add_to_order, and reset the order with clear_order. "
-    "To see the contents of the order so far, call get_order (this is shown to you, not the user) "
-    "Always confirm_order with the user (double-check) before calling place_order. Calling confirm_order will "
-    "display the order items to the user and returns their response to seeing the list. Their response may contain modifications. "
-    "Always verify and respond with drink and modifier names from the MENU before adding them to the order. "
-    "If you are unsure a drink or modifier matches those on the MENU, ask a question to clarify or redirect. "
-    "You only have the modifiers listed on the menu. "
-    "Once the customer has finished ordering items, Call confirm_order to ensure it is correct then make "
-    "any necessary updates and then call place_order. Once place_order has returned, thank the user and "
-    "say goodbye!",
+# Set up logging
+logging.basicConfig(
+    filename='agent_actions.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
 )
 
-WELCOME_MSG = "Welcome to the BaristaBot cafe. Type `q` to quit. How may I serve you today?"
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-def human_node(state: OrderState) -> OrderState:
-    """Display the last model message to the user, and receive the user's input."""
+llm = ChatOpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
+
+class SubTask(TypedDict):
+    """Represents a subtask in the analysis."""
+    description: str
+    complexity: str  # "simple", "moderate", "complex"
+    dependencies: List[str]  # IDs of tasks this depends on
+    estimated_time: str  # e.g., "5 minutes", "1 hour"
+
+class TaskAnalysis(TypedDict):
+    """Represents the analysis of a task."""
+    main_goal: str
+    subtasks: List[SubTask]
+    potential_risks: List[str]
+    required_resources: List[str]
+    estimated_total_time: str
+
+class Action(TypedDict):
+    """Represents a single action in the plan."""
+    action_type: str
+    description: str
+    parameters: Dict[str, str]
+    status: str  # "pending", "completed", "failed"
+    subtask_id: str  # Reference to the subtask this action fulfills
+
+class Plan(TypedDict):
+    """Represents a complete action plan."""
+    goal: str
+    analysis: TaskAnalysis
+    actions: List[Action]
+    status: str  # "draft", "confirmed", "executing", "completed", "cancelled"
+
+class AgentState(TypedDict):
+    """State representing the agent's conversation and actions."""
+    messages: Annotated[list, add_messages]
+    current_plan: Plan | None
+    needs_confirmation: bool
+    finished: bool
+
+
+def analyze_task(request: str) -> TaskAnalysis:
+    """Analyze the task and determine if it needs to be broken down into subtasks using LLM."""
+    prompt = f"""Analyze the following task and determine if it has the essential information needed to proceed.
+    Task: {request}
+
+    Essential information required for different task types:
+    1. For email tasks (MUST have):
+       - Recipient email address
+       - Basic purpose or subject
+    2. For meeting tasks (MUST have):
+       - At least one participant
+       - Basic purpose
+    3. For document tasks (MUST have):
+       - Document type
+       - Basic content purpose
+    4. For any task (MUST have):
+       - Clear basic objective
+
+    Optional information (nice to have but not required):
+    - Detailed timeline
+    - Specific attachments
+    - Detailed participant list
+    - Complex dependencies
+    - Detailed content specifications
+
+    If ANY essential information is missing, respond with:
+    {{
+        "needs_clarification": true,
+        "clarification_questions": [
+            "Specific question about missing essential information"
+        ],
+        "concerns": [
+            "Specific concern about missing essential information"
+        ]
+    }}
+
+    If ALL essential information is present (even if optional details are missing), provide a structured analysis including:
+    1. Main goal
+    2. Complexity assessment (simple/moderate/complex)
+    3. List of subtasks (only if the task is complex) with:
+       - Description
+       - Estimated time
+       - Dependencies (if any)
+    4. Potential risks
+    5. Required resources
+    6. Total estimated time
+
+    Format the response as a JSON object with the following structure:
+    {{
+        "main_goal": "string",
+        "complexity": "simple|moderate|complex",
+        "subtasks": [
+            {{
+                "description": "string",
+                "estimated_time": "string",
+                "dependencies": ["task_1", "task_2", ...]
+            }}
+        ],
+        "potential_risks": ["string"],
+        "required_resources": ["string"],
+        "estimated_total_time": "string"
+    }}
+
+    Note: If the task is simple, the 'subtasks' array should be empty.
+    IMPORTANT: Ensure the analysis is concise and only decomposes tasks when necessary.
+    IMPORTANT: Your response MUST be a valid JSON object.
+    IMPORTANT: Only ask for clarification if essential information is missing."""
+
+    # Get analysis from LLM
+    try:
+        response = llm.invoke(prompt)
+        # Extract JSON from the response
+        content = response.content.strip()
+        # Find the first { and last } to extract the JSON object
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start == -1 or end == 0:
+            raise ValueError("No JSON object found in response")
+        json_str = content[start:end]
+        analysis = json.loads(json_str)
+        
+        # Check if we need clarification
+        if "needs_clarification" in analysis and analysis["needs_clarification"]:
+            # Ensure the clarification response has the required fields
+            if not all(key in analysis for key in ["clarification_questions", "concerns"]):
+                raise ValueError("Invalid clarification response structure")
+            return analysis
+        
+        # Validate the structure for normal analysis
+        if not all(key in analysis for key in ["main_goal", "complexity", "subtasks", "potential_risks", "required_resources", "estimated_total_time"]):
+            raise ValueError("Invalid analysis structure")
+        
+        # Ensure subtasks have the required fields
+        for subtask in analysis["subtasks"]:
+            if not all(key in subtask for key in ["description", "estimated_time", "dependencies"]):
+                raise ValueError("Invalid subtask structure")
+        
+        return analysis
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.error(f"Error parsing LLM response: {str(e)}")
+        # Return a clarification request for the basic task
+        return {
+            "needs_clarification": True,
+            "clarification_questions": [
+                "What is the basic task you want to perform?",
+                "What is the minimum information needed to start this task?"
+            ],
+            "concerns": [
+                "The request is too vague to determine the basic task",
+                "Unable to identify the essential requirements"
+            ]
+        }
+
+
+def create_plan(request: str) -> Plan:
+    """Create a detailed plan based on the user's request using LLM."""
+    # First, analyze the task
+    analysis = analyze_task(request)
     
+    # If the analysis indicates we need clarification, return it directly
+    if "needs_clarification" in analysis and analysis["needs_clarification"]:
+        return {
+            "goal": request,
+            "analysis": analysis,
+            "actions": [],
+            "status": "needs_clarification"
+        }
+    
+    # Generate actions based on the analysis using LLM
+    prompt = f"""Based on the following task analysis, create a detailed action plan.
+    Analysis: {json.dumps(analysis, indent=2)}
+
+    For each subtask, create one or more specific actions that will accomplish it.
+    Use the following action types where appropriate:
+    - send_email: For sending emails
+    - create_document: For creating documents
+    - search_web: For web searches
+    - analyze_data: For data analysis
+    - schedule_meeting: For scheduling meetings
+    - custom_action: For other types of actions
+
+    Format the response as a JSON array of actions with the following structure:
+    [
+        {{
+            "action_type": "string",
+            "description": "string",
+            "parameters": {{
+                "key": "value"
+            }},
+            "status": "pending",
+            "subtask_id": "task_X"
+        }}
+    ]
+
+    Ensure the actions are specific, actionable, and aligned with the subtasks."""
+
+    # Get actions from LLM
+    response = llm.invoke(prompt)
+    
+    try:
+        # Parse the LLM response as JSON
+        actions = json.loads(response.content)
+        
+        # Validate the structure of each action
+        for action in actions:
+            if not all(key in action for key in ["action_type", "description", "parameters", "status", "subtask_id"]):
+                raise ValueError("Invalid action structure")
+        
+        return {
+            "goal": request,
+            "analysis": analysis,
+            "actions": actions,
+            "status": "draft"
+        }
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.error(f"Error parsing LLM response for actions: {str(e)}")
+        raise e
+
+def execute_action(action: Action) -> str:
+    """Execute a single action from the plan."""
+    try:
+        if action["action_type"] == "send_email":
+            # Mock email sending
+            return f"Email sent to {action['parameters'].get('recipient', 'unknown')}"
+        elif action["action_type"] == "create_document":
+            # Mock document creation
+            return f"Document created with content: {action['parameters'].get('content', '')}"
+        elif action["action_type"] == "search_web":
+            # Mock web search
+            return f"Search results for: {action['parameters'].get('query', '')}"
+        elif action["action_type"] == "analyze_data":
+            # Mock data analysis
+            return f"Analysis completed for: {action['parameters'].get('data', '')}"
+        elif action["action_type"] == "schedule_meeting":
+            # Mock meeting scheduling
+            return f"Meeting scheduled with: {action['parameters'].get('participants', '')}"
+        else:
+            # Handle custom actions
+            return f"Executed: {action['description']}"
+    except Exception as e:
+        return f"Action failed: {str(e)}"
+
+def log_action(action: Action, outcome: str) -> None:
+    """Log the action and its outcome."""
+    logging.info(f"Action: {action['description']} | Type: {action['action_type']} | Outcome: {outcome}")
+
+def human_node(state: AgentState) -> AgentState:
+    """Display the last model message to the user, and receive the user's input."""
     last_msg = state["messages"][-1]
     print("Model:", last_msg.content)
 
     user_input = interrupt("Give me your reply")
-    print()
-    print("user_input")
-    print(user_input)
-    print()
+    print("User input:", user_input)
 
-    if user_input in {"q", "quit", "exit", "goodbye"}:
-        state["finished"] = True
+    if user_input.lower() in {"quit", "exit", "goodbye"}:
+        return {
+            "messages": [("user", user_input)],
+            "current_plan": state.get("current_plan"),
+            "needs_confirmation": state.get("needs_confirmation", False),
+            "finished": True
+        }
 
-    return state | {"messages": [("user", user_input)]}
+    return {
+        "messages": [("user", user_input)],
+        "current_plan": state.get("current_plan"),
+        "needs_confirmation": state.get("needs_confirmation", False),
+        "finished": False
+    }
 
-
-
-def maybe_exit_human_node(state: OrderState) -> Literal["chatbot", "__end__"]:
-    """Route to the chatbot, unless it looks like the user is exiting."""
+def maybe_exit_human_node(state: AgentState) -> Literal["planner", "agent", "__end__"]:
+    """Route to the appropriate node based on the state."""
     if state.get("finished", False):
-        return END
-    else:
-        return "chatbot"
+        return "__end__"
     
+    # If we have a plan that needs confirmation, go to agent
+    if state.get("current_plan") and state.get("needs_confirmation"):
+        return "agent"
+    
+    # Otherwise, go to planner to create/modify the plan
+    return "planner"
 
-@tool
-def get_menu() -> str:
-    """Provide the latest up-to-date menu."""
-    # Note that this is just hard-coded text, but you could connect this to a live stock
-    # database, or you could use Gemini's multi-modal capabilities and take live photos of
-    # your cafe's chalk menu or the products on the counter and assmble them into an input.
+def format_clarification_request(analysis: dict) -> str:
+    """Format the clarification request for display to the user."""
+    output = {
+        "type": "clarification_request",
+        "title": "Task Needs Clarification",
+        "concerns": analysis.get("concerns", []),
+        "questions": analysis.get("clarification_questions", []),
+        "suggestions": analysis.get("suggestions", [])
+    }
+    return json.dumps(output)
 
-    return """
-    MENU:
-    Coffee Drinks:
-    Espresso
-    Americano
-    Cold Brew
+def format_plan_for_display(plan: Plan) -> str:
+    """Format the plan for display to the user."""
+    output = {
+        "type": "plan",
+        "title": "Task Analysis and Plan",
+        "goal": plan["goal"],
+        "analysis": {
+            "complexity": plan["analysis"]["complexity"],
+            "estimated_time": plan["analysis"]["estimated_total_time"],
+            "subtasks": [
+                {
+                    "description": subtask["description"],
+                    "estimated_time": subtask["estimated_time"],
+                    "dependencies": subtask["dependencies"]
+                }
+                for subtask in plan["analysis"]["subtasks"]
+            ],
+            "risks": plan["analysis"]["potential_risks"],
+            "resources": plan["analysis"]["required_resources"]
+        },
+        "actions": [
+            {
+                "description": action["description"],
+                "type": action["action_type"],
+                "status": action["status"],
+                "parameters": action["parameters"]
+            }
+            for action in plan["actions"]
+        ],
+        "status": plan["status"]
+    }
+    return json.dumps(output)
 
-    Coffee Drinks with Milk:
-    Latte
-    Cappuccino
-    Cortado
-    Macchiato
-    Mocha
-    Flat White
+def format_execution_results(plan: Plan, results: List[str]) -> str:
+    """Format the execution results for display to the user."""
+    output = {
+        "type": "execution_results",
+        "title": "Plan Execution Results",
+        "status": plan["status"],
+        "results": results,
+        "summary": {
+            "total_actions": len(plan["actions"]),
+            "completed_actions": sum(1 for action in plan["actions"] if action["status"] == "completed"),
+            "failed_actions": sum(1 for action in plan["actions"] if action["status"] == "failed")
+        }
+    }
+    return json.dumps(output)
 
-    Tea Drinks:
-    English Breakfast Tea
-    Green Tea
-    Earl Grey
+def format_error_message(error: str) -> str:
+    """Format error messages consistently."""
+    output = {
+        "type": "error",
+        "title": "Error Occurred",
+        "message": error,
+        "timestamp": datetime.now().isoformat()
+    }
+    return json.dumps(output)
 
-    Tea Drinks with Milk:
-    Chai Latte
-    Matcha Latte
-    London Fog
+def format_confirmation_request() -> str:
+    """Format the confirmation request message."""
+    output = {
+        "type": "confirmation_request",
+        "title": "Plan Confirmation Required",
+        "message": "Please review and confirm if this plan looks correct.",
+        "options": ["confirm", "modify", "cancel"]
+    }
+    return json.dumps(output)
 
-    Other Drinks:
-    Steamer
-    Hot Chocolate
+def format_modification_request() -> str:
+    """Format the modification request message."""
+    output = {
+        "type": "modification_request",
+        "title": "Plan Modification",
+        "message": "Please describe what changes you'd like to make to the plan.",
+        "current_plan": "available"  # Indicates that the current plan is available for reference
+    }
+    return json.dumps(output)
 
-    Modifiers:
-    Milk options: Whole, 2%, Oat, Almond, 2% Lactose Free; Default option: whole
-    Espresso shots: Single, Double, Triple, Quadruple; default: Double
-    Caffeine: Decaf, Regular; default: Regular
-    Hot-Iced: Hot, Iced; Default: Hot
-    Sweeteners (option to add one or more): vanilla sweetener, hazelnut sweetener, caramel sauce, chocolate sauce, sugar free vanilla sweetener
-    Special requests: any reasonable modification that does not involve items not on the menu, for example: 'extra hot', 'one pump', 'half caff', 'extra foam', etc.
+def planner_node(state: AgentState) -> AgentState:
+    """The planner node that creates and modifies action plans."""
+    if not state["messages"]:
+        return {
+            "messages": [AIMessage(content=json.dumps({
+                "type": "greeting",
+                "title": "Welcome",
+                "message": "Hello! What would you like me to help you with?"
+            }))],
+            "current_plan": None,
+            "needs_confirmation": False,
+            "finished": False
+        }
 
-    "dirty" means add a shot of espresso to a drink that doesn't usually have it, like "Dirty Chai Latte".
-    "Regular milk" is the same as 'whole milk'.
-    "Sweetened" means add some regular sugar, not a sweetener.
+    last_user_msg = state["messages"][-1]
+    
+    try:
+        # If we have a plan and the user wants to modify it
+        if state.get("current_plan") and "modify" in last_user_msg.content.lower():
+            # Create a new plan based on the modification request
+            new_plan = create_plan(last_user_msg.content)
+            if new_plan["status"] == "needs_clarification":
+                return {
+                    "messages": [AIMessage(content=format_clarification_request(new_plan["analysis"]))],
+                    "current_plan": None,
+                    "needs_confirmation": False,
+                    "finished": False
+                }
+            return {
+                "messages": [AIMessage(content=format_plan_for_display(new_plan))],
+                "current_plan": new_plan,
+                "needs_confirmation": True,
+                "finished": False
+            }
+        
+        # Create a new plan
+        plan = create_plan(last_user_msg.content)
+        
+        # Check if we need clarification
+        if plan["status"] == "needs_clarification":
+            return {
+                "messages": [AIMessage(content=format_clarification_request(plan["analysis"]))],
+                "current_plan": None,
+                "needs_confirmation": False,
+                "finished": False
+            }
+        
+        # If no clarification needed, proceed with the plan
+        return {
+            "messages": [AIMessage(content=format_plan_for_display(plan))],
+            "current_plan": plan,
+            "needs_confirmation": True,
+            "finished": False
+        }
+    except Exception as e:
+        logging.error(f"Error in planner node: {str(e)}")
+        return {
+            "messages": [AIMessage(content=format_error_message(str(e)))],
+            "current_plan": None,
+            "needs_confirmation": False,
+            "finished": False
+        }
 
-    Soy milk has run out of stock today, so soy is not available.
-  """
+def agent_node(state: AgentState) -> AgentState:
+    """The agent node that executes the confirmed plan."""
+    if not state.get("current_plan"):
+        return {
+            "messages": [AIMessage(content=format_error_message("No plan to execute. Please create a plan first."))],
+            "current_plan": None,
+            "needs_confirmation": False,
+            "finished": False
+        }
 
-@tool
-def add_to_order(drink: str, modifiers: Iterable[str]) -> str:
-    """Adds the specified drink to the customer's order, including any modifiers.
-
-    Returns:
-      The updated order in progress.
-    """
-
-
-@tool
-def confirm_order() -> str:
-    """Asks the customer if the order is correct.
-
-    Returns:
-      The user's free-text response.
-    """
-
-
-@tool
-def get_order() -> str:
-    """Returns the users order so far. One item per line."""
-
-
-@tool
-def clear_order():
-    """Removes all items from the user's order."""
-
-
-@tool
-def place_order() -> int:
-    """Sends the order to the barista for fulfillment.
-
-    Returns:
-      The estimated number of minutes until the order is ready.
-    """
-
-
-def order_node(state: OrderState) -> OrderState:
-    """The ordering node. This is where the order state is manipulated."""
-    tool_msg = state.get("messages", [])[-1]
-    order = state.get("order", [])
-    outbound_msgs = []
-    order_placed = False
-
-    for tool_call in tool_msg.tool_calls:
-
-        if tool_call["name"] == "add_to_order":
-
-            modifiers = tool_call["args"]["modifiers"]
-            modifier_str = ", ".join(modifiers) if modifiers else "no modifiers"
-
-            order.append(f'{tool_call["args"]["drink"]} ({modifier_str})')
-            response = "\n".join(order)
-
-        elif tool_call["name"] == "confirm_order":
-
-            print("Your order:")
-            if not order:
-                print("  (no items)")
-
-            for drink in order:
-                print(f"  {drink}")
-
-            # response = input("Is this correct? ")
-            response = "yes"
-
-        elif tool_call["name"] == "get_order":
-
-            response = "\n".join(order) if order else "(no order)"
-
-        elif tool_call["name"] == "clear_order":
-
-            order.clear()
-            response = None
-
-        elif tool_call["name"] == "place_order":
-
-            order_text = "\n".join(order)
-            print("Sending order to kitchen!")
-            print(order_text)
-
-            # TODO(you!): Implement cafe.
-            order_placed = True
-            response = randint(1, 5)  # ETA in minutes
-
+    last_user_msg = state["messages"][-1]
+    
+    if state.get("needs_confirmation"):
+        # Check if user confirmed the plan
+        if last_user_msg.content.lower() in {"yes", "confirm", "proceed"}:
+            # Execute the plan
+            plan = state["current_plan"]
+            plan["status"] = "executing"
+            results = []
+            
+            for action in plan["actions"]:
+                outcome = execute_action(action)
+                log_action(action, outcome)
+                action["status"] = "completed"
+                results.append(f"✓ {action['description']}: {outcome}")
+            
+            plan["status"] = "completed"
+            return {
+                "messages": [AIMessage(content=format_execution_results(plan, results))],
+                "current_plan": plan,
+                "needs_confirmation": False,
+                "finished": False
+            }
         else:
-            raise NotImplementedError(f'Unknown tool call: {tool_call["name"]}')
+            # User declined or wants modifications
+            return {
+                "messages": [AIMessage(content=format_modification_request())],
+                "current_plan": state["current_plan"],
+                "needs_confirmation": False,
+                "finished": False
+            }
+    
+    return state
 
-        # Record the tool results as tool messages.
-        outbound_msgs.append(
-            ToolMessage(
-                content=response,
-                name=tool_call["name"],
-                tool_call_id=tool_call["id"],
-            )
-        )
-
-    return {"messages": outbound_msgs, "order": order, "finished": order_placed}
-
-
-def maybe_route_to_tools(state: OrderState) -> str:
-    """Route between chat and tool nodes if a tool call is made."""
-    if not (msgs := state.get("messages", [])):
-        raise ValueError(f"No messages found when parsing state: {state}")
-
-    msg = msgs[-1]
-
+def maybe_route_to_tools(state: AgentState) -> Literal["planner", "agent", "human"]:
+    """Route between different nodes based on the state."""
+    if not state.get("messages", []):
+        return "planner"
+    
     if state.get("finished", False):
-        # When an order is placed, exit the app. The system instruction indicates
-        # that the chatbot should say thanks and goodbye at this point, so we can exit
-        # cleanly.
-        return END
-
-    elif hasattr(msg, "tool_calls") and len(msg.tool_calls) > 0:
-        # Route to `tools` node for any automated tool calls first.
-        if any(
-            tool["name"] in tool_node.tools_by_name.keys() for tool in msg.tool_calls
-        ):
-            return "tools"
-        else:
-            return "ordering"
-
-    else:
         return "human"
+    
+    return "human"
 
+# Set up the graph
+graph_builder = StateGraph(AgentState)
 
-
-auto_tools = [get_menu]
-tool_node = ToolNode(auto_tools)
-
-order_tools = [add_to_order, confirm_order, get_order, clear_order, place_order]
-
-llm_with_tools = llm.bind_tools(auto_tools + order_tools)
-
-def chatbot_with_tools(state: OrderState) -> OrderState:
-    """The chatbot with tools. A simple wrapper around the model's own chat interface."""
-    # defaults = {"order": [], "finished": False}
-
-    if state["messages"]:
-        new_output = llm_with_tools.invoke([BARISTABOT_SYSINT] + state["messages"])
-        print("new output")
-        print(new_output)
-        print("*****************************************")
-    else:
-        new_output = AIMessage(content=WELCOME_MSG)
-
-    # return defaults | state | {"messages": [new_output]}
-    return {"messages": [new_output]}
-
-graph_builder = StateGraph(OrderState)
-
-graph_builder.add_node("chatbot", chatbot_with_tools)
+# Add nodes
+graph_builder.add_node("planner", planner_node)
+graph_builder.add_node("agent", agent_node)
 graph_builder.add_node("human", human_node)
-graph_builder.add_node("tools", tool_node)
-graph_builder.add_node("ordering", order_node)
 
-# Chatbot -> {ordering, tools, human, END}
-graph_builder.add_conditional_edges("chatbot", maybe_route_to_tools)
-# Human -> {chatbot, END}
+# Add edges
+graph_builder.add_conditional_edges("planner", maybe_route_to_tools)
+graph_builder.add_conditional_edges("agent", maybe_route_to_tools)
 graph_builder.add_conditional_edges("human", maybe_exit_human_node)
+graph_builder.add_edge(START, "planner")
 
-# Tools (both kinds) always route back to chat afterwards.
-graph_builder.add_edge("tools", "chatbot")
-graph_builder.add_edge("ordering", "chatbot")
-
-graph_builder.add_edge(START, "chatbot")
-
+# Compile the graph
 checkpointer = MemorySaver()
-
-
-graph_with_menu = graph_builder.compile(
-    checkpointer=checkpointer 
-)
-
-
-
-
-
-
+graph = graph_builder.compile(checkpointer=checkpointer)
