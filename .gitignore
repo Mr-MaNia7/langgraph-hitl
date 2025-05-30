@@ -42,3 +42,7 @@ htmlcov/
 
 # Local development
 .DS_Store
+
+# Google credentials
+credentials.json
+token.pickle

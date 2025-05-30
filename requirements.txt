@@ -9,3 +9,8 @@ langchain-core>=0.3.48
 gunicorn>=21.2.0
 rich>=13.9.5
 langsmith>=0.3.42
+google-auth==2.27.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.170.0
+pandas>=2.2.0

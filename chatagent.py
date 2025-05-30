@@ -1,18 +1,22 @@
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
-from typing import Annotated, TypedDict, Literal, List, Dict
+from typing import Annotated, TypedDict, Literal, List, Dict, Any
 from langgraph.graph.message import add_messages
 from langchain_core.messages.ai import AIMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command, interrupt
-from langgraph.prebuilt import ToolNode
-from langchain_core.messages.tool import ToolMessage
 import os
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
 import json
+from utils.tools import (
+    generate_products,
+    create_google_sheet,
+    export_sheet,
+    AVAILABLE_TOOLS
+)
 
 # Set up logging
 logging.basicConfig(
@@ -62,6 +66,7 @@ class AgentState(TypedDict):
     current_plan: Plan | None
     needs_confirmation: bool
     finished: bool
+    tools_output: Dict[str, Any]  # Store tool outputs
 
 
 def analyze_task(request: str) -> TaskAnalysis:
@@ -73,21 +78,14 @@ def analyze_task(request: str) -> TaskAnalysis:
     1. For email tasks (MUST have):
        - Recipient email address
        - Basic purpose or subject
-    2. For meeting tasks (MUST have):
-       - At least one participant
-       - Basic purpose
-    3. For document tasks (MUST have):
-       - Document type
-       - Basic content purpose
-    4. For any task (MUST have):
+    2. For product data tasks (MUST have):
+       - Number of products
+    3. For any task (MUST have):
        - Clear basic objective
 
     Optional information (nice to have but not required):
     - Detailed timeline
-    - Specific attachments
-    - Detailed participant list
     - Complex dependencies
-    - Detailed content specifications
 
     If ANY essential information is missing, respond with:
     {{
@@ -198,11 +196,10 @@ def create_plan(request: str) -> Plan:
 
     For each subtask, create one or more specific actions that will accomplish it.
     Use the following action types where appropriate:
-    - send_email: For sending emails
-    - create_document: For creating documents
-    - search_web: For web searches
-    - analyze_data: For data analysis
-    - schedule_meeting: For scheduling meetings
+    - generate_products: For generating product data (requires num_products parameter)
+    - create_sheet: For creating Google Sheets (requires title and data parameters)
+    - export_sheet: For exporting Google Sheets (requires sheet_id and format (csv or xlsx) parameters)
+    - send_email: For sending emails (requires recipient and subject parameters)
     - custom_action: For other types of actions
 
     Format the response as a JSON array of actions with the following structure:
@@ -218,7 +215,8 @@ def create_plan(request: str) -> Plan:
         }}
     ]
 
-    Ensure the actions are specific, actionable, and aligned with the subtasks."""
+    Ensure the actions are specific, actionable, and aligned with the subtasks.
+    IMPORTANT: Do not include any text before or after the JSON array. Just the JSON array."""
 
     # Get actions from LLM
     response = llm.invoke(prompt)
@@ -242,28 +240,54 @@ def create_plan(request: str) -> Plan:
         logging.error(f"Error parsing LLM response for actions: {str(e)}")
         raise e
 
-def execute_action(action: Action) -> str:
+def execute_action(action: Action, tools_output: Dict[str, Any] = None) -> str:
     """Execute a single action from the plan."""
     try:
-        if action["action_type"] == "send_email":
-            # Mock email sending
-            return f"Email sent to {action['parameters'].get('recipient', 'unknown')}"
-        elif action["action_type"] == "create_document":
-            # Mock document creation
-            return f"Document created with content: {action['parameters'].get('content', '')}"
-        elif action["action_type"] == "search_web":
-            # Mock web search
-            return f"Search results for: {action['parameters'].get('query', '')}"
-        elif action["action_type"] == "analyze_data":
-            # Mock data analysis
-            return f"Analysis completed for: {action['parameters'].get('data', '')}"
-        elif action["action_type"] == "schedule_meeting":
-            # Mock meeting scheduling
-            return f"Meeting scheduled with: {action['parameters'].get('participants', '')}"
+        if action["action_type"] == "generate_products":
+            num_products = int(action["parameters"].get("num_products", 3))
+            # Use invoke() instead of direct call
+            products = generate_products.invoke({"num_products": num_products})
+            if tools_output is not None:
+                tools_output["products"] = products
+            return f"Generated {len(products)} products successfully"
+
+        elif action["action_type"] == "create_sheet":
+            if not tools_output or "products" not in tools_output:
+                raise ValueError("No product data available. Generate products first.")
+            
+            title = action["parameters"].get("title", "Product List")
+            # Use invoke() instead of direct call
+            sheet_result = create_google_sheet.invoke({
+                "title": title,
+                "data": tools_output["products"]
+            })
+            if tools_output is not None:
+                tools_output["sheet"] = sheet_result
+            return f"Created Google Sheet: {sheet_result['shareable_link']}"
+
+        elif action["action_type"] == "export_sheet":
+            if not tools_output or "sheet" not in tools_output:
+                raise ValueError("No sheet available. Create a sheet first.")
+            
+            format = action["parameters"].get("format", "csv")
+            # Use invoke() instead of direct call
+            export_path = export_sheet.invoke({
+                "sheet_id": tools_output["sheet"]["sheet_id"],
+                "format": format
+            })
+            if tools_output is not None:
+                tools_output["export_path"] = export_path
+            return f"Exported sheet to {export_path}"
+
+        elif action["action_type"] == "send_email":
+            # For now, just return a mock message since we're not implementing email
+            return f"Email would be sent: {action['description']}"
+
         else:
-            # Handle custom actions
-            return f"Executed: {action['description']}"
+            return f"Unknown action type: {action['action_type']}"
+
     except Exception as e:
+        logging.error(f"Error executing action: {str(e)}")
         return f"Action failed: {str(e)}"
 
 def log_action(action: Action, outcome: str) -> None:
@@ -394,6 +418,10 @@ def format_modification_request() -> str:
     }
     return json.dumps(output)
 
+# def create_tool_node() -> ToolNode:
+#     """Create a ToolNode with our custom tools."""
+#     return ToolNode(tools=AVAILABLE_TOOLS)
+
 def planner_node(state: AgentState) -> AgentState:
     """The planner node that creates and modifies action plans."""
     if not state["messages"]:
@@ -401,11 +429,12 @@ def planner_node(state: AgentState) -> AgentState:
             "messages": [AIMessage(content=json.dumps({
                 "type": "greeting",
                 "title": "Welcome",
-                "message": "Hello! What would you like me to help you with?"
+                "message": "Hello! I can help you generate product data, create Google Sheets, and send emails. What would you like me to do?"
             }))],
             "current_plan": None,
             "needs_confirmation": False,
-            "finished": False
+            "finished": False,
+            "tools_output": {}
         }
 
     last_user_msg = state["messages"][-1]
@@ -420,13 +449,15 @@ def planner_node(state: AgentState) -> AgentState:
                     "messages": [AIMessage(content=format_clarification_request(new_plan["analysis"]))],
                     "current_plan": None,
                     "needs_confirmation": False,
-                    "finished": False
+                    "finished": False,
+                    "tools_output": {}
                 }
             return {
                 "messages": [AIMessage(content=format_plan_for_display(new_plan))],
                 "current_plan": new_plan,
                 "needs_confirmation": True,
-                "finished": False
+                "finished": False,
+                "tools_output": {}
             }
         
         # Create a new plan
@@ -438,7 +469,8 @@ def planner_node(state: AgentState) -> AgentState:
                 "messages": [AIMessage(content=format_clarification_request(plan["analysis"]))],
                 "current_plan": None,
                 "needs_confirmation": False,
-                "finished": False
+                "finished": False,
+                "tools_output": {}
             }
         
         # If no clarification needed, proceed with the plan
@@ -446,7 +478,8 @@ def planner_node(state: AgentState) -> AgentState:
             "messages": [AIMessage(content=format_plan_for_display(plan))],
             "current_plan": plan,
             "needs_confirmation": True,
-            "finished": False
+            "finished": False,
+            "tools_output": {}
         }
     except Exception as e:
         logging.error(f"Error in planner node: {str(e)}")
@@ -454,7 +487,8 @@ def planner_node(state: AgentState) -> AgentState:
             "messages": [AIMessage(content=format_error_message(str(e)))],
             "current_plan": None,
             "needs_confirmation": False,
-            "finished": False
+            "finished": False,
+            "tools_output": {}
         }
 
 def agent_node(state: AgentState) -> AgentState:
@@ -464,7 +498,8 @@ def agent_node(state: AgentState) -> AgentState:
             "messages": [AIMessage(content=format_error_message("No plan to execute. Please create a plan first."))],
             "current_plan": None,
             "needs_confirmation": False,
-            "finished": False
+            "finished": False,
+            "tools_output": {}
         }
 
     last_user_msg = state["messages"][-1]
@@ -476,9 +511,10 @@ def agent_node(state: AgentState) -> AgentState:
             plan = state["current_plan"]
             plan["status"] = "executing"
             results = []
+            tools_output = {}
             
             for action in plan["actions"]:
-                outcome = execute_action(action)
+                outcome = execute_action(action, tools_output)
                 log_action(action, outcome)
                 action["status"] = "completed"
                 results.append(f"✓ {action['description']}: {outcome}")
@@ -488,7 +524,8 @@ def agent_node(state: AgentState) -> AgentState:
                 "messages": [AIMessage(content=format_execution_results(plan, results))],
                 "current_plan": plan,
                 "needs_confirmation": False,
-                "finished": False
+                "finished": False,
+                "tools_output": tools_output
             }
         else:
             # User declined or wants modifications
@@ -496,7 +533,8 @@ def agent_node(state: AgentState) -> AgentState:
                 "messages": [AIMessage(content=format_modification_request())],
                 "current_plan": state["current_plan"],
                 "needs_confirmation": False,
-                "finished": False
+                "finished": False,
+                "tools_output": {}
             }
     
     return state
@@ -518,6 +556,7 @@ graph_builder = StateGraph(AgentState)
 graph_builder.add_node("planner", planner_node)
 graph_builder.add_node("agent", agent_node)
 graph_builder.add_node("human", human_node)
+# graph_builder.add_node("tools", create_tool_node())
 
 # Add edges
 graph_builder.add_conditional_edges("planner", maybe_route_to_tools)
