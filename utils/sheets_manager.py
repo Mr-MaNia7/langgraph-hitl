@@ -5,8 +5,7 @@ import pandas as pd
 from typing import List, Dict, Any
 import os
 from dotenv import load_dotenv
-from datetime import datetime
-import logging
+from utils.logger import log_error, log_success
 
 load_dotenv()
 
@@ -22,7 +21,7 @@ class GoogleSheetsManager:
             self.sheets_service = build('sheets', 'v4', credentials=self.credentials)
             self.drive_service = build('drive', 'v3', credentials=self.credentials)
         except Exception as e:
-            logging.error(f"Error initializing Google Sheets Manager: {str(e)}")
+            log_error("Error initializing Google Sheets Manager", e)
             raise
 
     def create_sheet(self, title: str) -> str:
@@ -34,9 +33,11 @@ class GoogleSheetsManager:
                 }
             }
             spreadsheet = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            return spreadsheet['spreadsheetId']
+            sheet_id = spreadsheet['spreadsheetId']
+            log_success(f"Created sheet with ID: {sheet_id}")
+            return sheet_id
         except Exception as e:
-            logging.error(f"Error creating sheet: {str(e)}")
+            log_error("Error creating sheet", e)
             raise
 
     def add_data_to_sheet(self, spreadsheet_id: str, data: List[Dict[str, Any]]) -> None:
@@ -65,8 +66,9 @@ class GoogleSheetsManager:
                 valueInputOption='RAW',
                 body=body
             ).execute()
+            log_success("Added data to sheet")
         except Exception as e:
-            logging.error(f"Error adding data to sheet: {str(e)}")
+            log_error("Error adding data to sheet", e)
             raise
 
     def get_shareable_link(self, spreadsheet_id: str) -> str:
@@ -95,9 +97,11 @@ class GoogleSheetsManager:
                 fields='webViewLink'
             ).execute()
             
-            return file.get('webViewLink')
+            link = file.get('webViewLink')
+            log_success(f"Generated shareable link: {link}")
+            return link
         except Exception as e:
-            logging.error(f"Error getting shareable link: {str(e)}")
+            log_error("Error getting shareable link", e)
             raise
 
     def export_as_csv(self, spreadsheet_id: str, output_path: str) -> str:
@@ -118,9 +122,10 @@ class GoogleSheetsManager:
                 downloader = request.execute()
                 f.write(downloader)
             
+            log_success(f"Exported sheet as CSV to {output_path}")
             return output_path
         except Exception as e:
-            logging.error(f"Error exporting sheet as CSV: {str(e)}")
+            log_error("Error exporting sheet as CSV", e)
             raise
 
     def export_as_excel(self, spreadsheet_id: str, output_path: str) -> str:
@@ -141,9 +146,10 @@ class GoogleSheetsManager:
                 downloader = request.execute()
                 f.write(downloader)
             
+            log_success(f"Exported sheet as Excel to {output_path}")
             return output_path
         except Exception as e:
-            logging.error(f"Error exporting sheet as Excel: {str(e)}")
+            log_error("Error exporting sheet as Excel", e)
             raise
 
 if __name__ == "__main__":
@@ -152,7 +158,6 @@ if __name__ == "__main__":
     
     # Create a new sheet
     sheet_id = manager.create_sheet("Test Sheet")
-    print(f"Created sheet with ID: {sheet_id}")
     
     # Add some test data
     test_data = [
@@ -160,8 +165,6 @@ if __name__ == "__main__":
         {"name": "Jane Smith", "age": 25}
     ]
     manager.add_data_to_sheet(sheet_id, test_data)
-    print("Added test data to sheet")
     
     # Get shareable link
     link = manager.get_shareable_link(sheet_id)
-    print(f"Shareable link: {link}")

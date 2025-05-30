@@ -70,6 +70,47 @@ function formatMessage(message: string, clarificationQuestions?: string[], conce
               </ul>
             </div>
           )}
+          {data.links && Object.keys(data.links).length > 0 && (
+            <div className="mt-3">
+              <b>Links:</b>
+              <ul className="list-none pl-5 mt-1 space-y-2">
+                {data.links.sheet && (
+                  <li>
+                    <a 
+                      href={data.links.sheet}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:text-blue-800 flex items-center gap-2"
+                    >
+                      <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                        <polyline points="15 3 21 3 21 9"></polyline>
+                        <line x1="10" y1="14" x2="21" y2="3"></line>
+                      </svg>
+                      View Google Sheet
+                    </a>
+                  </li>
+                )}
+                {data.links.export && (
+                  <li>
+                    <a 
+                      href={data.links.export}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:text-blue-800 flex items-center gap-2"
+                    >
+                      <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                      </svg>
+                      Download Export
+                    </a>
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
           {data.summary && (
             <div className="text-xs text-green-800 mt-2">
               <b>Summary:</b> {data.summary.completed_actions} of {data.summary.total_actions} actions completed, {data.summary.failed_actions} failed.

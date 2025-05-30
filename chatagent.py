@@ -1,138 +1,32 @@
 from langgraph.graph import StateGraph, START, END
-from langchain_openai import ChatOpenAI
-from typing import Annotated, TypedDict, Literal, List, Dict, Any
-from langgraph.graph.message import add_messages
+from typing import Literal, List, Dict, Any
 from langchain_core.messages.ai import AIMessage
-from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command, interrupt
-import os
-from dotenv import load_dotenv
-import logging
+from langgraph.types import interrupt
 from datetime import datetime
 import json
 from utils.tools import (
     generate_products,
     create_google_sheet,
     export_sheet,
-    AVAILABLE_TOOLS
+)
+from interface import TaskAnalysis, Action, Plan, AgentState
+from llm import get_chat_llm
+from prompts.task_analysis import TASK_ANALYSIS_PROMPT
+from prompts.action_plan import ACTION_PLAN_PROMPT
+from utils.logger import (
+    log_model_message,
+    log_user_input,
+    log_action,
+    log_error,
 )
 
-# Set up logging
-logging.basicConfig(
-    filename='agent_actions.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s'
-)
-
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-llm = ChatOpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
-
-class SubTask(TypedDict):
-    """Represents a subtask in the analysis."""
-    description: str
-    complexity: str  # "simple", "moderate", "complex"
-    dependencies: List[str]  # IDs of tasks this depends on
-    estimated_time: str  # e.g., "5 minutes", "1 hour"
-
-class TaskAnalysis(TypedDict):
-    """Represents the analysis of a task."""
-    main_goal: str
-    subtasks: List[SubTask]
-    potential_risks: List[str]
-    required_resources: List[str]
-    estimated_total_time: str
-
-class Action(TypedDict):
-    """Represents a single action in the plan."""
-    action_type: str
-    description: str
-    parameters: Dict[str, str]
-    status: str  # "pending", "completed", "failed"
-    subtask_id: str  # Reference to the subtask this action fulfills
-
-class Plan(TypedDict):
-    """Represents a complete action plan."""
-    goal: str
-    analysis: TaskAnalysis
-    actions: List[Action]
-    status: str  # "draft", "confirmed", "executing", "completed", "cancelled"
-
-class AgentState(TypedDict):
-    """State representing the agent's conversation and actions."""
-    messages: Annotated[list, add_messages]
-    current_plan: Plan | None
-    needs_confirmation: bool
-    finished: bool
-    tools_output: Dict[str, Any]  # Store tool outputs
-
+llm = get_chat_llm()
 
 def analyze_task(request: str) -> TaskAnalysis:
     """Analyze the task and determine if it needs to be broken down into subtasks using LLM."""
-    prompt = f"""Analyze the following task and determine if it has the essential information needed to proceed.
-    Task: {request}
-
-    Essential information required for different task types:
-    1. For email tasks (MUST have):
-       - Recipient email address
-       - Basic purpose or subject
-    2. For product data tasks (MUST have):
-       - Number of products
-    3. For any task (MUST have):
-       - Clear basic objective
-
-    Optional information (nice to have but not required):
-    - Detailed timeline
-    - Complex dependencies
-
-    If ANY essential information is missing, respond with:
-    {{
-        "needs_clarification": true,
-        "clarification_questions": [
-            "Specific question about missing essential information"
-        ],
-        "concerns": [
-            "Specific concern about missing essential information"
-        ]
-    }}
-
-    If ALL essential information is present (even if optional details are missing), provide a structured analysis including:
-    1. Main goal
-    2. Complexity assessment (simple/moderate/complex)
-    3. List of subtasks (only if the task is complex) with:
-       - Description
-       - Estimated time
-       - Dependencies (if any)
-    4. Potential risks
-    5. Required resources
-    6. Total estimated time
-
-    Format the response as a JSON object with the following structure:
-    {{
-        "main_goal": "string",
-        "complexity": "simple|moderate|complex",
-        "subtasks": [
-            {{
-                "description": "string",
-                "estimated_time": "string",
-                "dependencies": ["task_1", "task_2", ...]
-            }}
-        ],
-        "potential_risks": ["string"],
-        "required_resources": ["string"],
-        "estimated_total_time": "string"
-    }}
-
-    Note: If the task is simple, the 'subtasks' array should be empty.
-    IMPORTANT: Ensure the analysis is concise and only decomposes tasks when necessary.
-    IMPORTANT: Your response MUST be a valid JSON object.
-    IMPORTANT: Only ask for clarification if essential information is missing."""
-
-    # Get analysis from LLM
     try:
-        response = llm.invoke(prompt)
+        response = llm.invoke(TASK_ANALYSIS_PROMPT.format(request=request))
         # Extract JSON from the response
         content = response.content.strip()
         # Find the first { and last } to extract the JSON object
@@ -161,7 +55,7 @@ def analyze_task(request: str) -> TaskAnalysis:
         
         return analysis
     except (json.JSONDecodeError, ValueError) as e:
-        logging.error(f"Error parsing LLM response: {str(e)}")
+        log_error("Error parsing LLM response", e)
         # Return a clarification request for the basic task
         return {
             "needs_clarification": True,
@@ -174,7 +68,6 @@ def analyze_task(request: str) -> TaskAnalysis:
                 "Unable to identify the essential requirements"
             ]
         }
-
 
 def create_plan(request: str) -> Plan:
     """Create a detailed plan based on the user's request using LLM."""
@@ -191,37 +84,9 @@ def create_plan(request: str) -> Plan:
         }
     
     # Generate actions based on the analysis using LLM
-    prompt = f"""Based on the following task analysis, create a detailed action plan.
-    Analysis: {json.dumps(analysis, indent=2)}
-
-    For each subtask, create one or more specific actions that will accomplish it.
-    Use the following action types where appropriate:
-    - generate_products: For generating product data (requires num_products parameter)
-    - create_sheet: For creating Google Sheets (requires title and data parameters)
-    - export_sheet: For exporting Google Sheets (requires sheet_id and format (csv or xlsx) parameters)
-    - send_email: For sending emails (requires recipient and subject parameters)
-    - custom_action: For other types of actions
-
-    Format the response as a JSON array of actions with the following structure:
-    [
-        {{
-            "action_type": "string",
-            "description": "string",
-            "parameters": {{
-                "key": "value"
-            }},
-            "status": "pending",
-            "subtask_id": "task_X"
-        }}
-    ]
-
-    Ensure the actions are specific, actionable, and aligned with the subtasks.
-    IMPORTANT: Do not include any text before or after the JSON array. Just the JSON array."""
-
-    # Get actions from LLM
-    response = llm.invoke(prompt)
-    
     try:
+        response = llm.invoke(ACTION_PLAN_PROMPT.format(analysis=json.dumps(analysis, indent=2)))
+        
         # Parse the LLM response as JSON
         actions = json.loads(response.content)
         
@@ -237,7 +102,7 @@ def create_plan(request: str) -> Plan:
             "status": "draft"
         }
     except (json.JSONDecodeError, ValueError) as e:
-        logging.error(f"Error parsing LLM response for actions: {str(e)}")
+        log_error("Error parsing LLM response for actions", e)
         raise e
 
 def execute_action(action: Action, tools_output: Dict[str, Any] = None) -> str:
@@ -280,27 +145,31 @@ def execute_action(action: Action, tools_output: Dict[str, Any] = None) -> str:
             return f"Exported sheet to {export_path}"
 
         elif action["action_type"] == "send_email":
+            if not tools_output or "sheet" not in tools_output:
+                raise ValueError("No sheet available. Create a sheet first.")
+            
+            recipient = action["parameters"].get("recipient")
+            subject = action["parameters"].get("subject", "Product List")
+            body = action["parameters"].get("body", None)
+            sheet_link = tools_output["sheet"]["shareable_link"] if "shareable_link" in tools_output["sheet"] else None
+
             # For now, just return a mock message since we're not implementing email
-            return f"Email would be sent: {action['description']}"
+            return f"Email would be sent to {recipient} with subject '{subject}' and body '{body}'containing the sheet link: {sheet_link}"
 
         else:
             return f"Unknown action type: {action['action_type']}"
 
     except Exception as e:
-        logging.error(f"Error executing action: {str(e)}")
+        log_error("Error executing action", e)
         return f"Action failed: {str(e)}"
-
-def log_action(action: Action, outcome: str) -> None:
-    """Log the action and its outcome."""
-    logging.info(f"Action: {action['description']} | Type: {action['action_type']} | Outcome: {outcome}")
 
 def human_node(state: AgentState) -> AgentState:
     """Display the last model message to the user, and receive the user's input."""
     last_msg = state["messages"][-1]
-    print("Model:", last_msg.content)
+    log_model_message(last_msg.content)
 
     user_input = interrupt("Give me your reply")
-    print("User input:", user_input)
+    log_user_input(user_input)
 
     if user_input.lower() in {"quit", "exit", "goodbye"}:
         return {
@@ -373,8 +242,16 @@ def format_plan_for_display(plan: Plan) -> str:
     }
     return json.dumps(output)
 
-def format_execution_results(plan: Plan, results: List[str]) -> str:
+def format_execution_results(plan: Plan, results: List[str], tools_output: Dict[str, Any] = None) -> str:
     """Format the execution results for display to the user."""
+    # Extract links from tools_output if available
+    links = {}
+    if tools_output:
+        if "sheet" in tools_output and "shareable_link" in tools_output["sheet"]:
+            links["sheet"] = tools_output["sheet"]["shareable_link"]
+        if "export_path" in tools_output:
+            links["export"] = tools_output["export_path"]
+
     output = {
         "type": "execution_results",
         "title": "Plan Execution Results",
@@ -386,6 +263,11 @@ def format_execution_results(plan: Plan, results: List[str]) -> str:
             "failed_actions": sum(1 for action in plan["actions"] if action["status"] == "failed")
         }
     }
+    
+    # Add links if any exist
+    if links:
+        output["links"] = links
+
     return json.dumps(output)
 
 def format_error_message(error: str) -> str:
@@ -424,7 +306,7 @@ def format_modification_request() -> str:
 
 def planner_node(state: AgentState) -> AgentState:
     """The planner node that creates and modifies action plans."""
-    if not state["messages"]:
+    if not state.get("messages"):
         return {
             "messages": [AIMessage(content=json.dumps({
                 "type": "greeting",
@@ -482,7 +364,7 @@ def planner_node(state: AgentState) -> AgentState:
             "tools_output": {}
         }
     except Exception as e:
-        logging.error(f"Error in planner node: {str(e)}")
+        log_error("Error in planner node", e)
         return {
             "messages": [AIMessage(content=format_error_message(str(e)))],
             "current_plan": None,
@@ -515,13 +397,13 @@ def agent_node(state: AgentState) -> AgentState:
             
             for action in plan["actions"]:
                 outcome = execute_action(action, tools_output)
-                log_action(action, outcome)
+                log_action(action["action_type"], action["description"], outcome)
                 action["status"] = "completed"
                 results.append(f"✓ {action['description']}: {outcome}")
             
             plan["status"] = "completed"
             return {
-                "messages": [AIMessage(content=format_execution_results(plan, results))],
+                "messages": [AIMessage(content=format_execution_results(plan, results, tools_output))],
                 "current_plan": plan,
                 "needs_confirmation": False,
                 "finished": False,
@@ -534,7 +416,7 @@ def agent_node(state: AgentState) -> AgentState:
                 "current_plan": state["current_plan"],
                 "needs_confirmation": False,
                 "finished": False,
-                "tools_output": {}
+                "tools_output": state.get("tools_output", {})
             }
     
     return state

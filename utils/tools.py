@@ -2,12 +2,12 @@ from langchain_core.tools import tool
 from typing import List, Dict, Any, Optional
 from .data_generator import ProductDataGenerator
 from .sheets_manager import GoogleSheetsManager
-import os
 from datetime import datetime
+from config import GOOGLE_SERVICE_ACCOUNT_PATH, EXPORT_DIR
 
 # Initialize the utility classes
 data_generator = ProductDataGenerator()
-sheets_manager = GoogleSheetsManager(os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH"))
+sheets_manager = GoogleSheetsManager(GOOGLE_SERVICE_ACCOUNT_PATH)
 
 @tool
 def generate_products(num_products: int = 10) -> List[Dict[str, Any]]:
@@ -53,10 +53,10 @@ def export_sheet(sheet_id: str, format: str = "csv") -> str:
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if format == "csv":
-        output_path = f"exports/products_{timestamp}.csv"
+        output_path = f"{EXPORT_DIR}/products_{timestamp}.csv"
         return sheets_manager.export_as_csv(sheet_id, output_path)
     else:
-        output_path = f"exports/products_{timestamp}.xlsx"
+        output_path = f"{EXPORT_DIR}/products_{timestamp}.xlsx"
         return sheets_manager.export_as_excel(sheet_id, output_path)
 
 # List of all available tools
